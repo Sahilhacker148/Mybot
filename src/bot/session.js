@@ -34,6 +34,61 @@ async function _getBaileys() {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * Clean and validate phone number
+ * Accepts: +923001234567  923001234567  03001234567
+ * Returns: digits only, e.g. 923001234567
+ */
+function cleanPhoneNumber(raw) {
+  if (!raw) return null;
+  // Remove all non-digits
+  let digits = String(raw).replace(/[^0-9]/g, '');
+  // Pakistan local: 03XXXXXXXXX → 923XXXXXXXXX
+  if (digits.startsWith('0') && digits.length === 11) {
+    digits = '92' + digits.slice(1);
+  }
+  // Must be 10-15 digits after cleaning
+  if (digits.length < 10 || digits.length > 15) return null;
+  return digits;
+}
+
+/**
+ * Core pairing code request with retry logic
+ * WhatsApp noise protocol handshake must complete BEFORE requesting code.
+ * We wait for the socket to be fully connected (connection.update fires with
+ * connection === undefined or 'connecting'), then delay 6 seconds minimum.
+ */
+async function requestPairCodeWithRetry(sock, cleanPhone, sessionId, wsClient, maxRetries = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[${sessionId}] Pair code attempt ${attempt}/${maxRetries} for +${cleanPhone}`);
+      // sock.requestPairingCode is async and returns an 8-char code
+      const code = await sock.requestPairingCode(cleanPhone);
+      if (!code) throw new Error('Empty code returned from WhatsApp');
+      // Format as XXXX-XXXX for display
+      const formattedCode = String(code).match(/.{1,4}/g)?.join('-') || code;
+      console.log(`[${sessionId}] Pair code success: ${formattedCode}`);
+      _sendWS(wsClient, { type: 'pairCode', code: formattedCode });
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.error(`[${sessionId}] Pair code attempt ${attempt} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        // Wait longer before each retry
+        await sleep(attempt * 3000);
+      }
+    }
+  }
+  // All retries exhausted
+  console.error(`[${sessionId}] All pair code attempts failed. Last error: ${lastError?.message}`);
+  _sendWS(wsClient, {
+    type: 'error',
+    message: `Pairing code failed after ${maxRetries} attempts. Check your number and try again.`,
+  });
+  return false;
+}
+
 async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', phoneNumber = null }) {
   const {
     makeWASocket,
@@ -52,6 +107,14 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
 
   const logger = pino({ level: 'silent' });
 
+  // Clean phone number once, upfront
+  const cleanPhone = cleanPhoneNumber(phoneNumber);
+  if (mode === 'pair' && !cleanPhone) {
+    console.error(`[${sessionId}] Invalid phone number: ${phoneNumber}`);
+    _sendWS(wsClient, { type: 'error', message: 'Invalid phone number. Use country code e.g. +923001234567' });
+    return null;
+  }
+
   const sock = makeWASocket({
     version,
     auth: {
@@ -60,7 +123,7 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
     },
     logger,
     printQRInTerminal:              false,
-    // FIX 1: ubuntu browser required for pair code — macOS causes "Couldn't link device"
+    // CRITICAL: Ubuntu browser REQUIRED for pairing code — macOS/Windows causes "Couldn't link device" error
     browser:                        Browsers.ubuntu('Chrome'),
     generateHighQualityLinkPreview: false,
     syncFullHistory:                false,
@@ -69,7 +132,7 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
     keepAliveIntervalMs:            25_000,
     retryRequestDelayMs:            500,
     maxMsgRetryCount:               5,
-    // FIX 2: fireInitQueries:false breaks pair code auth — must be true
+    // CRITICAL: must be true for pairing code auth to work properly
     fireInitQueries:                true,
     getMessage:                     async () => ({ conversation: '' }),
   });
@@ -80,47 +143,39 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
   let reconnectTimer = null;
   let pairCodeTimer  = null;
 
+  // CRITICAL FIX: Schedule pairing code immediately after socket creation.
+  // We do NOT wait for connection.update because on first connect,
+  // WhatsApp sends NO event until after noise handshake completes.
+  // Waiting 7 seconds gives the WS noise protocol time to finish.
+  if (mode === 'pair' && cleanPhone && !sock.authState.creds.registered) {
+    pairCodeTimer = setTimeout(async () => {
+      if (pairRequested) return;
+      // Double-check: if already registered/connected, skip
+      if (sock.authState.creds.registered) {
+        console.log(`[${sessionId}] Already registered, skipping pair code`);
+        return;
+      }
+      pairRequested = true;
+      await requestPairCodeWithRetry(sock, cleanPhone, sessionId, wsClient, 3);
+    }, 7000); // 7s: handshake typically completes in 2-4s, 7s is safe margin
+  }
+
   async function onConnectionUpdate(update) {
     const { connection, lastDisconnect, qr } = update;
 
+    // QR code mode
     if (qr && mode === 'qr') {
-      const qrImage = await QRCode.toDataURL(qr);
-      _sendWS(wsClient, { type: 'qr', qr: qrImage });
-    }
-
-    // FIX 3: Request pair code only once, after proper delay for noise handshake
-    if (
-      mode === 'pair' &&
-      phoneNumber &&
-      !pairRequested &&
-      !sock.authState.creds.registered &&
-      !pairCodeTimer
-    ) {
-      pairCodeTimer = setTimeout(async () => {
-        if (pairRequested) return;
-        pairRequested = true;
-        try {
-          const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-          console.log('Requesting pair code for', cleanPhone, '[' + sessionId + ']');
-          const code = await sock.requestPairingCode(cleanPhone);
-          const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-          _sendWS(wsClient, { type: 'pairCode', code: formattedCode });
-          console.log('Pair code sent for', sessionId + ':', formattedCode);
-        } catch (err) {
-          console.error('Pair code error for', sessionId + ':', err.message);
-          pairRequested = false;
-          pairCodeTimer = null;
-          _sendWS(wsClient, {
-            type: 'error',
-            message: 'Failed to generate pair code. Please try again.',
-          });
-        }
-      // FIX 4: 5000ms delay — enough time for WhatsApp noise protocol handshake
-      }, 5000);
+      try {
+        const qrImage = await QRCode.toDataURL(qr);
+        _sendWS(wsClient, { type: 'qr', qr: qrImage });
+      } catch (err) {
+        console.error(`[${sessionId}] QR generation error:`, err.message);
+      }
     }
 
     if (connection === 'open') {
       clearTimeout(pairCodeTimer);
+      pairCodeTimer = null;
       await _onConnected(sock, sessionId, userId, wsClient);
       botManager.resetReconnect(sessionId);
       clearTimeout(reconnectTimer);
@@ -128,6 +183,7 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
 
     if (connection === 'close') {
       clearTimeout(pairCodeTimer);
+      pairCodeTimer = null;
       const statusCode      = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -136,17 +192,17 @@ async function createBotSession({ sessionId, userId, wsClient, mode = 'pair', ph
         if (attempts < 10) {
           botManager.incrementReconnect(sessionId);
           const delay = Math.min(1000 * Math.pow(2, attempts), 30_000);
-          console.log('Reconnecting', sessionId, 'in', delay + 'ms (attempt ' + (attempts + 1) + ')');
+          console.log(`[${sessionId}] Reconnecting in ${delay}ms (attempt ${attempts + 1})`);
           reconnectTimer = setTimeout(() => {
             createBotSession({ sessionId, userId, wsClient: null, mode, phoneNumber });
           }, delay);
         } else {
-          console.log('Max reconnect attempts for', sessionId);
+          console.log(`[${sessionId}] Max reconnect attempts reached`);
           _sendWS(wsClient, { type: 'error', message: 'Max reconnect attempts reached. Please redeploy.' });
           botManager.stopBot(sessionId);
         }
       } else {
-        console.log('Session logged out:', sessionId);
+        console.log(`[${sessionId}] Session logged out`);
         _sendWS(wsClient, { type: 'disconnected', sessionId });
         botManager.stopBot(sessionId);
       }
